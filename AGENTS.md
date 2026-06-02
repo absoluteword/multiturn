@@ -3,7 +3,7 @@
 ## 依赖
 
 - Python 3.x
-- `sglang` package (for `sglang.bench_serving`, `sglang.benchmark.*`, `sglang.test.kits.cache_hit_kit`)
+- `sglang` package (for `sglang.bench_serving`, `sglang.benchmark.datasets.random`, `sglang.test.kits.cache_hit_kit`)
 - `aiohttp` (vLLM / OpenAI-compatible 模式必需)
 - `requests`, `numpy`, `tqdm`, `pandas`, `matplotlib`
 
@@ -64,7 +64,7 @@ python estimate_concurrency.py --list-models  # 查看支持的模型
 
 - `plot_mul.py` / `plot_round_tput.py` 必须使用 `matplotlib.use('Agg')`（无头环境），字体优先使用 WenQuanYi Zen Hei，Windows 下回退到 SimHei / DejaVu Sans
 - `bench_multiturn.py` 默认 `--disable-auto-run`（禁用自动多速率测试）、`--disable-random-sample`（禁用随机采样）、`--enable-round-barrier`（启用轮次屏障）
-- vLLM 模式下服务器通常不返回 `cached_tokens`，脚本会自动以 `predicted_chr` 估算 cache hit rate
+- vLLM 模式下服务器通常不返回 `cached_tokens`，脚本会自动以 `predicted_chr` 估算 cache hit rate；若 vLLM 启动时加了 `--enable-prompt-tokens-details`，则可获取真实 `cached_tokens`
 - CSV 中 `cache_hit_rate` 和 `round_X_chr` 存储的是百分比值（整数），`ttft`/`itl` 单位为毫秒
 - 全局 `total_tp` 定义为 `(sum(miss_tokens) + sum(generated_len)) / duration`，仅计入 miss + output
 - 输出文件自动保存到 `{output_dir}/bench_data/`

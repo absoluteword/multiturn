@@ -66,6 +66,13 @@ async def async_request_vllm_chat_completions(payload, url, pbar):
     cached_tokens = 0
     output_ids = []
 
+    # Track whether the vLLM server's usage chunk contains
+    # prompt_tokens_details. If usage is present but details are
+    # missing, the server is almost certainly missing the
+    # --enable-prompt-tokens-details flag.
+    usage_seen = False
+    prompt_tokens_details_seen = False
+
     if aiohttp is None:
         raise RuntimeError(
             "aiohttp is required for --api-format openai with vLLM. "
@@ -93,10 +100,12 @@ async def async_request_vllm_chat_completions(payload, url, pbar):
                     # (choices: []) that would otherwise be skipped.
                     usage = chunk.get("usage")
                     if usage:
+                        usage_seen = True
                         prompt_len = usage.get("prompt_tokens", prompt_len)
                         completion_len = usage.get("completion_tokens", completion_len)
                         pdetails = usage.get("prompt_tokens_details")
                         if pdetails:
+                            prompt_tokens_details_seen = True
                             cached_tokens = pdetails.get("cached_tokens", cached_tokens)
 
                     # Skip chunks that carry no actual token content for TTFT purposes
@@ -138,6 +147,14 @@ async def async_request_vllm_chat_completions(payload, url, pbar):
     output.output_ids = output_ids
     output.itl = []  # ITL estimated from latency-ttft in bench_multiturn.py
     output.cached_tokens = cached_tokens
+
+    # Attach per-request diagnostic flags so the response_handler can
+    # decide whether to warn. Even when --enable-prompt-tokens-details
+    # is set, the very first request has num_cached_tokens=0 (cold
+    # cache) and vLLM omits prompt_tokens_details from that response;
+    # so we cannot decide based on a single request.
+    output._vllm_usage_seen = usage_seen
+    output._vllm_details_seen = prompt_tokens_details_seen
 
     if pbar is not None:
         pbar.update(1)
@@ -533,6 +550,16 @@ class WorkloadGenerator:
             "end_time": [],
         }
         self.enable_round_barrier = args.enable_round_barrier
+
+        # vLLM diagnostic counters: vLLM omits `prompt_tokens_details`
+        # from the very first request even when the server has
+        # --enable-prompt-tokens-details (because num_cached_tokens=0
+        # on cold cache), so we have to wait for several responses
+        # before we can conclude the flag is missing.
+        self._vllm_diag_total = 0
+        self._vllm_diag_with_details = 0
+        self._vllm_diag_check_after = 5
+        self._vllm_diag_warned = False
         if self.enable_round_barrier:
             # Add round-specific metrics while preserving the original structure
             for i in range(self.max_rounds):
@@ -657,6 +684,31 @@ class WorkloadGenerator:
                     estimated_cached_tokens = response.cached_tokens if response.cached_tokens > 0 else 0
                 else:
                     estimated_cached_tokens = response.cached_tokens
+
+                # vLLM diagnostic: accumulate whether the server is
+                # returning prompt_tokens_details. We need several
+                # samples because the first request of each client is
+                # a cold-cache hit and vLLM omits prompt_tokens_details
+                # for that request even when the flag is enabled.
+                if self.api_format == "openai":
+                    self._vllm_diag_total += 1
+                    if getattr(response, "_vllm_details_seen", False):
+                        self._vllm_diag_with_details += 1
+                    if (
+                        not self._vllm_diag_warned
+                        and self._vllm_diag_total >= self._vllm_diag_check_after
+                        and self._vllm_diag_with_details == 0
+                    ):
+                        self._vllm_diag_warned = True
+                        print(
+                            "\n[bench_multiturn WARNING] After "
+                            f"{self._vllm_diag_total} vLLM responses, none "
+                            "included 'usage.prompt_tokens_details'. "
+                            "Cache hit rate will be reported as 0. "
+                            "Restart vllm serve with: "
+                            "--enable-prompt-tokens-details\n",
+                            file=sys.stderr,
+                        )
 
                 miss_tokens = max(0, response.prompt_len - estimated_cached_tokens)
                 hit_tokens = estimated_cached_tokens

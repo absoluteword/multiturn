@@ -42,9 +42,11 @@ python bench_multiturn.py \
     --ready-queue-policy random
 ```
 
-#### vLLM / OpenAI-Compatible API（`--api-format openai  --enable-prompt-tokens-details`    ）
+#### vLLM / OpenAI-Compatible API
 
-连接 vLLM 等 OpenAI-compatible 服务端点时，需显式指定 `--api-format openai以及--enable-prompt-tokens-details`：
+连接 vLLM 等 OpenAI-compatible 服务端点时，需显式指定 `--api-format openai`。
+
+> **关键点：** 若希望 vLLM 返回真实的 `cached_tokens`，启动 vLLM 服务时须添加 `--enable-prompt-tokens-details` 参数。否则脚本会基于客户端已知的 `prompt_len - sub_q_len` 自动估算 `cache_hit_rate`，其值与 `predicted_chr` 基本一致。
 
 ```bash
 python bench_multiturn.py \
@@ -64,14 +66,13 @@ python bench_multiturn.py \
     --disable-random-sample \
     --enable-round-barrier \
     --range-ratio 0.8 \
-    --output-dir 6000D_GLM5_tp8_vllm \
-    --enable-prompt-tokens-details
+    --output-dir 6000D_GLM5_tp8_vllm
 ```
 
 > **关键点：**
 > - `--api-format openai` 切换到 OpenAI-compatible `/v1/chat/completions` 端点，内部使用自定义 `async_request_vllm_chat_completions` 处理 SSE 流式响应。
 > - 脚本会自动跳过 vLLM 不支持的 `/flush_cache` 和 SGLang `/generate` 心跳请求。
-> - 由于 vLLM 的 OpenAI API 通常**不返回** `usage.prompt_tokens_details.cached_tokens`，脚本会基于客户端已知的 `prompt_len - sub_q_len` 自动估算 `cache_hit_rate`，其值与 `predicted_chr` 基本一致。
+> - 由于 vLLM 的 OpenAI API 通常**不返回** `usage.prompt_tokens_details.cached_tokens`，脚本会基于客户端已知的 `prompt_len - sub_q_len` 自动估算 `cache_hit_rate`，其值与 `predicted_chr` 基本一致。若 vLLM 启动时添加了 `--enable-prompt-tokens-details`，则可获取真实的 `cached_tokens`。
 > - **如果启动 vLLM 时用了 `--served-model-name` 自定义模型名，请务必通过 `--served-model-name` 参数传入**，否则脚本默认使用 `--model-path` 的 basename，可能报 404 `model does not exist`。
 
 #### 完整参数说明
@@ -372,9 +373,10 @@ python estimate_concurrency.py \
 2. **每卡 KV 缓存池**：`per_gpu_kv = gpu_mem × mem_fraction - per_gpu_weight`
 3. **扣除固定开销后有效 KV**：`effective_kv = (per_gpu_kv - overhead_fixed) × overhead_rate`
 4. **每 token KV 字节数**（取决于注意力机制）：
-   - MLA 模型：`num_layers × (latent_kv_dim + rope_head_dim)`
-   - 标准 MHA/GQA：`2 × num_layers × num_kv_heads × head_dim`
+   - MLA 模型：`num_layers × (kv_lora_rank + qk_rope_head_dim [+ index_head_dim])`
+   - 标准 MHA/GQA：`2 × num_kv_heads × head_dim × num_gqa_layers`
    - Gated DeltaNet：由固定线性注意力状态决定，非逐 token 增长
+   - V4 (CSA+HCA)：`v4_slope_bytes × seq_len + v4_fixed_kb × 1024`
 5. **每序列 KV 大小**：`single_token_bytes × context_length`（部分模型含固定开销）
 6. **最大并发数**：`int(kv_cache_budget / kv_per_sequence)`
 
@@ -382,16 +384,20 @@ python estimate_concurrency.py \
 
 **支持模型列表：**
 
-| Key | 模型全称 | 注意力机制 | 总参数 | 激活参数 | 层数 | 上下文长度 |
-|-----|----------|-----------|--------|----------|------|-----------|
-| `deepseekv4_pro` | DeepSeek-V4-Pro | CSA + HCA | 1600B | 49B | 61 | 1M |
-| `deepseekv4_flash` | DeepSeek-V4-Flash | CSA + HCA | 284B | 13B | 43 | 1M |
-| `qwen3.6_35b_a3b` | Qwen3.6-35B-A3B | Gated DeltaNet + GA | 35B | 3B | 40 | 256K |
-| `minimax_m2.5` | MiniMax-M2.5 | Standard MHA | 229B | 10B | 62 | 128K |
-| `kimi_k2.6` | Kimi-K2.6 | MLA | 1040B | 32B | 61 | 256K |
-| `glm5.1` | GLM-5.1 | MLA + DSA | 754B | 40B | 78 | 202K |
-| `kimi_k2.5` | Kimi-K2.5 | MLA | 1040B | 32B | 61 | 256K |
-| `glm5` | GLM-5 | MLA + DSA | 744B | 40B | 78 | 202K |
+| Key | 模型全称 | 注意力机制 | 总参数 | 激活参数 | 层数 |
+|-----|----------|-----------|--------|----------|------|
+| `deepseekv4_pro` | DeepSeek-V4-Pro | CSA + HCA | 1600B | 49B | 61 |
+| `deepseekv4_flash` | DeepSeek-V4-Flash | CSA + HCA | 284B | 13B | 43 |
+| `step3.7_flash` | Step-3.7-Flash | GQA (full + sliding window) | 196B | 11B | 45 |
+| `qwen3.5_35b_a3b` | Qwen3.5-35B-A3B | Gated DeltaNet + GA | 35B | 3B | 40 |
+| `qwen3.5_397b_a17b` | Qwen3.5-397B-A17B | Gated DeltaNet + GA | 397B | 17B | 60 |
+| `qwen3.5_122b_a10b` | Qwen3.5-122B-A10B | Gated DeltaNet + GA | 122B | 10B | 48 |
+| `minimax_m2.5` | MiniMax-M2.5 | Standard MHA | 230B | 10B | 62 |
+| `minimax_m2` | MiniMax-M2 | Standard MHA | 230B | 10B | 62 |
+| `kimi_k2.6` | Kimi-K2.6 | MLA | 1000B | 32B | 61 |
+| `kimi_k2.5` | Kimi-K2.5 | MLA | 1000B | 32B | 61 |
+| `glm5.1` | GLM-5.1 | MLA + DSA | 744B | 40B | 78 |
+| `glm5` | GLM-5 | MLA + DSA | 744B | 40B | 78 |
 
 ---
 
